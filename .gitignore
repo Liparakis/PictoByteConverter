@@ -1,18 +1,29 @@
-# Ignore everything
+# Ignore everything by default
 *
 
-# But not these files...
+# Allow critical project configuration and documentation
 !.gitignore
 !README.md
-!LICENSE.md
+!LICENSE*
 !CMakeLists.txt
 
-# ...and not the src directory...
+# Allow source and include directories
+!include/
+!include/**
 !src/
 !src/**
-!src/Debug/Debug.cpp
+!cli/
+!cli/**
+!python/
+!python/**
+!examples/
+!examples/**
 
-# Exclude compiled output even in src
+# Exclude specific garbage/build artifacts EVEN within allowed directories
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
 **/*.o
 **/*.obj
 **/*.exe
@@ -21,22 +32,11 @@
 **/*.dylib
 **/*.a
 **/*.lib
-**/*.out
-
-# Exclude IDE and build directories
-**/.vs/
-**/.vscode/
-**/build/
-**/Release/
-**/x64/
-**/x86/
-**/bin/
-**/obj/
-**/CMakeFiles/
-
-# Exclude common temporary files
-**/*.log
-**/*.tmp
-**/*.temp
+**/*.pdb
+**/*.ilk
+**/*.exp
 **/.DS_Store
 **/Thumbs.db
+**/*.tmp
+**/*.temp
+**/*.log
