@@ -1,7 +1,6 @@
 #pragma once
-#include <cmath>
 #include <cstdint>
-#include <string>
+#include <utility>
 
 namespace pb {
 
@@ -57,36 +56,40 @@ struct BmpInfoHeader {
 constexpr size_t BMP_HEADER_SIZE = sizeof(BmpFileHeader) + sizeof(BmpInfoHeader); // 54 bytes
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tiny helpers
+// Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Integer ceiling sqrt via Newton's method — no floating-point conversion.
+[[nodiscard]] constexpr int32_t isqrt_ceil(size_t n) noexcept {
+    if (n <= 1) return static_cast<int32_t>(n);
+    size_t x = n;
+    size_t y = (x + 1) / 2;
+    while (y < x) {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    // x = floor(sqrt(n)); bump to ceil when n is not a perfect square.
+    return static_cast<int32_t>(x * x >= n ? x : x + 1);
+}
+
 /**
- * Compute the number of pixels required to store `payload_bytes` bytes when
- * packed 3 bytes per 24-bpp pixel (R,G,B carry one byte each).
- * Returns {width, height} where width*height >= ceil(payload_bytes/3).
+ * Compute {width, height} to store `payload_bytes` at 3 bytes/pixel.
+ * Width is rounded up to a multiple of 4 so BMP row stride is 4-byte aligned.
  */
-inline std::pair<int32_t, int32_t> optimal_dims(size_t payload_bytes) {
-    // Number of pixels needed
-    const size_t pixels = (payload_bytes + 2) / 3; // ceil
-    // Make it a square-ish rectangle; BMP rows must be 4-byte aligned.
-    // width is chosen as the ceiling of sqrt(pixels) and must pad to mult of 4.
-    auto isqrt = [](size_t n) -> int32_t {
-        auto r = static_cast<int32_t>(std::sqrt(static_cast<double>(n)));
-        while (static_cast<size_t>(r) * r < n) ++r;
-        return r;
-    };
-    int32_t w = isqrt(pixels);
-    // Round width up to multiple of 4 (avoids padding bytes and keeps row stride simple)
+[[nodiscard]] constexpr std::pair<int32_t, int32_t>
+optimal_dims(size_t payload_bytes) noexcept {
+    const size_t pixels = (payload_bytes + 2) / 3; // ceil(payload_bytes / 3)
+    int32_t w = isqrt_ceil(pixels);
     if (w % 4 != 0) w += (4 - w % 4);
-    auto h = static_cast<int32_t>((pixels + w - 1) / w);
+    const auto h = static_cast<int32_t>((pixels + w - 1) / w);
     return {w, h};
 }
 
 /**
- * Return the byte size of a BMP on disk for given width/height (24-bpp, row-padded to 4 bytes).
+ * Byte size of a 24-bpp BMP on disk for given dimensions (row-padded to 4 bytes).
  */
-inline size_t bmp_file_size(int32_t w, int32_t h) {
-    size_t row_stride = ((static_cast<size_t>(w) * 3 + 3) / 4) * 4;
+[[nodiscard]] constexpr size_t bmp_file_size(int32_t w, int32_t h) noexcept {
+    const size_t row_stride = ((static_cast<size_t>(w) * 3 + 3) / 4) * 4;
     return BMP_HEADER_SIZE + row_stride * static_cast<size_t>(h);
 }
 

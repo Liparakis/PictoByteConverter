@@ -4,10 +4,8 @@
 #include <pictobyte/BmpFormat.h>
 
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 #include <filesystem>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -17,7 +15,7 @@
 namespace fs = std::filesystem;
 
 namespace pb {
-    // ── File I/O helpers (mirrors Decoder pattern) ────────────────────────────────
+    // ── File I/O helpers ──────────────────────────────────────────────────────────
 
     namespace detail {
         using UniqueFile = std::unique_ptr<std::FILE, FileCloser>;
@@ -52,42 +50,13 @@ namespace pb {
         }
     } // namespace detail
 
-    // ── Metadata serialisation ────────────────────────────────────────────────────
-
-    [[nodiscard]] static std::vector<std::uint8_t>
-    build_meta(const std::uint32_t chunk_index,
-               const std::uint32_t total_chunks,
-               const std::uint64_t file_total_size,
-               const std::uint32_t raw_data_size,
-               const std::uint32_t chunk_capacity,
-               const std::string_view orig_filename) {
-        constexpr std::uint8_t kMagic[4] = {'P', 'B', 'C', '2'};
-
-        const auto fn_len = static_cast<std::uint8_t>(
-            std::min(orig_filename.size(), MAX_FILENAME_LEN));
-
-        ChunkMeta cm{};
-        std::memcpy(cm.magic, kMagic, sizeof(kMagic));
-        cm.chunk_index = chunk_index;
-        cm.total_chunks = total_chunks;
-        cm.file_total_size = file_total_size;
-        cm.raw_data_size = raw_data_size;
-        cm.chunk_capacity = chunk_capacity;
-        cm.filename_len = fn_len;
-
-        std::vector<std::uint8_t> meta(CHUNK_META_BASE_SIZE + fn_len);
-        std::memcpy(meta.data(), &cm, CHUNK_META_BASE_SIZE);
-        std::memcpy(meta.data() + CHUNK_META_BASE_SIZE, orig_filename.data(), fn_len);
-        return meta;
-    }
-
     // ── Per-chunk encoding ────────────────────────────────────────────────────────
 
     /**
-     * Read one chunk from `src` at `file_offset`, prepend its metadata header,
-     * and write the result to a BMP at `out_path`.
+     * Read one chunk from `src` at `file_offset`, serialise metadata directly
+     * into the pixel buffer (no intermediate meta vector), and write a BMP.
      *
-     * Each worker thread opens its own file handle, so no mutex is needed here.
+     * Each worker thread opens its own file handle, so no mutex is needed.
      */
     static void encode_chunk(std::FILE *src,
                              const std::uint64_t file_offset,
@@ -97,32 +66,41 @@ namespace pb {
                              const std::uint64_t file_total_size,
                              const std::uint32_t chunk_capacity,
                              const std::string_view orig_filename,
-                             const std::string &out_path,
-                             const Logger &logger) {
-        const auto meta = build_meta(chunk_index, total_chunks,
-                                     file_total_size, raw_size,
-                                     chunk_capacity, orig_filename);
+                             const std::string &out_path) {
+        constexpr std::uint8_t kMagic[4] = {'P', 'B', 'C', '2'};
+        const auto fn_len = static_cast<std::uint8_t>(
+            std::min(orig_filename.size(), MAX_FILENAME_LEN));
+        const std::size_t meta_sz = CHUNK_META_BASE_SIZE + fn_len;
 
-        const std::size_t total_payload = meta.size() + raw_size;
+        const std::size_t total_payload = meta_sz + raw_size;
         const auto [w, h] = optimal_dims(total_payload);
-
         const std::size_t pixel_bytes =
                 static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 3;
 
+        // Build payload in-place: ChunkMeta + filename + raw file data.
         std::vector<std::uint8_t> payload(pixel_bytes, 0u);
-        std::memcpy(payload.data(), meta.data(), meta.size());
+
+        ChunkMeta cm{};
+        std::memcpy(cm.magic, kMagic, sizeof(kMagic));
+        cm.chunk_index     = chunk_index;
+        cm.total_chunks    = total_chunks;
+        cm.file_total_size = file_total_size;
+        cm.raw_data_size   = raw_size;
+        cm.chunk_capacity  = chunk_capacity;
+        cm.filename_len    = fn_len;
+
+        std::memcpy(payload.data(), &cm, CHUNK_META_BASE_SIZE);
+        std::memcpy(payload.data() + CHUNK_META_BASE_SIZE, orig_filename.data(), fn_len);
 
         if (raw_size > 0) {
             detail::seek_file(src, file_offset);
-            const std::size_t n = std::fread(payload.data() + meta.size(), 1, raw_size, src);
+            const std::size_t n = std::fread(payload.data() + meta_sz, 1, raw_size, src);
             if (n != raw_size)
                 throw std::runtime_error("Short read from input at chunk " +
                                          std::to_string(chunk_index));
         }
 
         BmpWriter::write(out_path, payload.data(), total_payload, w, h);
-        logger.logf("Encoded chunk ", chunk_index + 1, '/', total_chunks,
-                    " -> ", out_path, " (", raw_size, " bytes)");
     }
 
     // ── Encoder::encode ───────────────────────────────────────────────────────────
@@ -135,8 +113,6 @@ namespace pb {
         if (chunk_size_mb < 1)
             throw std::runtime_error("chunk_size_mb must be >= 1");
 
-        // Measure the input file; we keep the handle open only for measurement —
-        // worker threads each open their own handle to avoid contention.
         const auto src = detail::open_file(input_path, "rb");
         const std::uint64_t fsize = detail::file_size(src.get());
 
@@ -144,7 +120,6 @@ namespace pb {
         const std::size_t fn_len = std::min(orig_filename.size(), MAX_FILENAME_LEN);
         const std::size_t meta_sz = CHUNK_META_BASE_SIZE + fn_len;
 
-        // Max payload per BMP, aligned down to whole pixel triplets.
         const std::size_t target_bmp_bytes =
                 static_cast<std::size_t>(chunk_size_mb) * 1024ULL * 1024ULL;
 
@@ -166,29 +141,35 @@ namespace pb {
         log.logf("Total chunks:   ", total_chunks);
         log.logf("Threads:        ", eff_threads);
 
-        // Bound queue depth to 2× thread count to cap peak RAM usage.
         ThreadPool pool(eff_threads, static_cast<std::size_t>(eff_threads) * 2);
+
+        // Pre-format total_chunks string once — avoids per-iteration to_string.
+        const std::string tc_str = std::to_string(total_chunks);
 
         for (std::uint64_t ci = 0; ci < total_chunks; ++ci) {
             const std::uint64_t offset = ci * raw_capacity;
             const std::uint64_t remaining = (fsize > offset) ? fsize - offset : 0u;
-            const std::uint32_t this_raw = static_cast<std::uint32_t>(
+            const auto this_raw = static_cast<std::uint32_t>(
                 std::min(remaining, static_cast<std::uint64_t>(raw_capacity)));
 
-            std::ostringstream oss;
-            oss << output_base << '_' << (ci + 1) << "of" << total_chunks << ".bmp";
-            std::string out_path = oss.str();
+            // String concatenation — no ostringstream heap overhead.
+            std::string out_path;
+            out_path.reserve(output_base.size() + tc_str.size() + 16);
+            out_path += output_base;
+            out_path += '_';
+            out_path += std::to_string(ci + 1);
+            out_path += "of";
+            out_path += tc_str;
+            out_path += ".bmp";
 
             pool.submit([=, &log] {
-                // Each worker opens its own file handle — no shared-state I/O.
                 const auto tf = detail::open_file(input_path, "rb");
                 encode_chunk(tf.get(), offset, this_raw,
                              static_cast<std::uint32_t>(ci),
                              static_cast<std::uint32_t>(total_chunks),
                              fsize,
                              static_cast<std::uint32_t>(raw_capacity),
-                             orig_filename, out_path, log);
-                // tf closed automatically on scope exit, even on exception.
+                             orig_filename, out_path);
             });
         }
 

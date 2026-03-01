@@ -1,16 +1,3 @@
-"""
-example.py — demonstrates the PictoByteConverter Python wrapper.
-
-Run from the repo root after building the shared library:
-    python examples/python/example.py
-
-This script:
-  1. Creates a 50 MB test file filled with random bytes.
-  2. Encodes it to BMP chunks (9 MB each → ~6 chunks).
-  3. Decodes the chunks back to the original file.
-  4. Verifies the SHA-256 hash matches.
-"""
-
 import hashlib
 import os
 import shutil
@@ -25,9 +12,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "python"))
 from pictobyte import PictoByteConverter
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-TEST_SIZE_MB     = 3000   # size of the synthetic test file
+TEST_SIZE_MB     = 1000   # size of the synthetic test file
 CHUNK_SIZE_MB    = 9    # target BMP chunk size
-NUM_THREADS      = 14    # 0 = auto-detect
+NUM_THREADS      = 0    # 0 = auto-detect
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 

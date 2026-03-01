@@ -42,28 +42,24 @@ inline void checked_read(std::FILE* f, void* buf, std::size_t n, std::string_vie
 // BmpWriter
 //
 // Encodes raw bytes into 24-bit RGB pixels and writes a bottom-up BMP file.
-// Width must be a multiple of 4 so row stride (w*3) is always 4-byte aligned
-// — no BMP row-padding bytes are needed.
+// Builds the entire file in a single contiguous buffer and issues one fwrite
+// call — eliminates per-row I/O syscalls.
 // ─────────────────────────────────────────────────────────────────────────────
 class BmpWriter {
 public:
-    /**
-     * @param path     Destination file path.
-     * @param payload  Raw bytes to encode (3 bytes → 1 pixel; last pixel zero-padded).
-     * @param size     Byte count of `payload`.
-     * @param w        Image width in pixels (must be a multiple of 4).
-     * @param h        Image height in pixels.
-     */
     static void write(std::string_view path,
                       const std::uint8_t* payload, std::size_t size,
                       std::int32_t w, std::int32_t h)
     {
-        const std::size_t row_stride     = static_cast<std::size_t>(w) * 3;
+        const std::size_t row_stride      = static_cast<std::size_t>(w) * 3;
         const std::size_t pixel_data_size = row_stride * static_cast<std::size_t>(h);
+        const std::size_t total_file_size = BMP_HEADER_SIZE + pixel_data_size;
 
-        // Build headers with designated defaults from BmpFormat.h.
+        // Build the complete BMP file in one contiguous buffer.
+        std::vector<std::uint8_t> buf(total_file_size, 0u);
+
         BmpFileHeader fh;
-        fh.bf_size     = static_cast<std::uint32_t>(BMP_HEADER_SIZE + pixel_data_size);
+        fh.bf_size     = static_cast<std::uint32_t>(total_file_size);
         fh.bf_off_bits = 54;
 
         BmpInfoHeader ih;
@@ -71,47 +67,40 @@ public:
         ih.bi_height     = h;   // positive → bottom-up storage
         ih.bi_size_image = static_cast<std::uint32_t>(pixel_data_size);
 
-        const auto f = detail::open_file(path, "wb");
+        std::memcpy(buf.data(), &fh, sizeof(fh));
+        std::memcpy(buf.data() + sizeof(fh), &ih, sizeof(ih));
 
-        detail::checked_write(f.get(), &fh, sizeof(fh), path);
-        detail::checked_write(f.get(), &ih, sizeof(ih), path);
+        // Place payload rows in BMP bottom-up order: logical row h-1 first.
+        std::uint8_t* pixels = buf.data() + BMP_HEADER_SIZE;
 
-        // Write rows bottom-up (BMP convention): logical row h-1 first.
-        std::vector<std::uint8_t> row(row_stride, 0u);
+        for (std::int32_t bmp_row = 0; bmp_row < h; ++bmp_row) {
+            const auto payload_row  = static_cast<std::size_t>(h - 1 - bmp_row);
+            const std::size_t src_off = payload_row * row_stride;
+            const std::size_t dst_off = static_cast<std::size_t>(bmp_row) * row_stride;
 
-        for (std::int32_t y = h - 1; y >= 0; --y) {
-            const std::size_t row_byte_offset = static_cast<std::size_t>(y) * row_stride;
-
-            // How many payload bytes fall inside this row?
-            const std::size_t copy_start = std::min(row_byte_offset, size);
-            const std::size_t copy_end   = std::min(row_byte_offset + row_stride, size);
+            const std::size_t copy_start = std::min(src_off, size);
+            const std::size_t copy_end   = std::min(src_off + row_stride, size);
             const std::size_t copy_len   = copy_end - copy_start;
 
             if (copy_len > 0)
-                std::memcpy(row.data(), payload + copy_start, copy_len);
-
-            // Zero-pad any trailing bytes (handles partial last pixel).
-            if (copy_len < row_stride)
-                std::memset(row.data() + copy_len, 0, row_stride - copy_len);
-
-            detail::checked_write(f.get(), row.data(), row_stride, path);
+                std::memcpy(pixels + dst_off, payload + copy_start, copy_len);
+            // Remainder stays zero from buffer initialization.
         }
-        // UniqueFile destructor closes the file.
+
+        // Single I/O call for the entire file.
+        const auto f = detail::open_file(path, "wb");
+        detail::checked_write(f.get(), buf.data(), total_file_size, path);
     }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BmpReader
 //
-// Reads a 24-bit BMP written by BmpWriter and returns the packed pixel bytes
-// in top-to-bottom, left-to-right order.
+// Reads a 24-bit BMP and returns packed pixel bytes in top-to-bottom order.
+// Reads all pixel data in a single fread, then rearranges rows in memory.
 // ─────────────────────────────────────────────────────────────────────────────
 class BmpReader {
 public:
-    /**
-     * @param path  Source BMP file.
-     * @param out   Receives the raw pixel bytes (w * h * 3 bytes, top-to-bottom).
-     */
     static void read(std::string_view path, std::vector<std::uint8_t>& out) {
         const auto f = detail::open_file(path, "rb");
 
@@ -123,31 +112,31 @@ public:
         if (fh.bf_type != 0x4D42)
             throw std::runtime_error("Not a BMP file: " + std::string(path));
 
-        // Negative height signals a top-down bitmap.
         const bool     bottom_up = ih.bi_height > 0;
         const std::int32_t w     = ih.bi_width;
         const std::int32_t h     = bottom_up ? ih.bi_height : -ih.bi_height;
 
-        // Row stride must be rounded up to the nearest 4-byte boundary.
-        const std::size_t row_stride = (static_cast<std::size_t>(w) * 3 + 3u) & ~3u;
+        const std::size_t row_bytes  = static_cast<std::size_t>(w) * 3;
+        const std::size_t row_stride = (row_bytes + 3u) & ~3u;
+        const std::size_t pixel_data_size = row_stride * static_cast<std::size_t>(h);
 
-        out.assign(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 3, 0u);
-
+        // Seek to pixel data start.
         std::fseek(f.get(), static_cast<long>(fh.bf_off_bits), SEEK_SET);
 
-        std::vector<std::uint8_t> row(row_stride);
+        // Single bulk read of all pixel data.
+        std::vector<std::uint8_t> raw(pixel_data_size);
+        detail::checked_read(f.get(), raw.data(), pixel_data_size, path);
+
+        // Rearrange rows into top-down logical order, stripping any padding.
+        out.resize(row_bytes * static_cast<std::size_t>(h));
 
         for (std::int32_t file_row = 0; file_row < h; ++file_row) {
-            // Map file row index to logical (top-down) row index.
             const std::int32_t logical_row = bottom_up ? (h - 1 - file_row) : file_row;
 
-            detail::checked_read(f.get(), row.data(), row_stride, path);
+            const std::size_t src_off = static_cast<std::size_t>(file_row)    * row_stride;
+            const std::size_t dst_off = static_cast<std::size_t>(logical_row) * row_bytes;
 
-            const std::size_t dst_offset =
-                static_cast<std::size_t>(logical_row) * static_cast<std::size_t>(w) * 3;
-
-            // Each row contains exactly w*3 meaningful bytes; padding bytes follow.
-            std::memcpy(out.data() + dst_offset, row.data(), static_cast<std::size_t>(w) * 3);
+            std::memcpy(out.data() + dst_off, raw.data() + src_off, row_bytes);
         }
     }
 };

@@ -3,13 +3,11 @@
 #include <pictobyte/BmpFormat.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
-#include <regex>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -21,13 +19,12 @@ namespace pb {
 
 // ── Internal types ────────────────────────────────────────────────────────────
 
-/** Metadata decoded from the ChunkMeta header embedded in each BMP. */
 struct ParsedMeta {
     std::uint32_t chunk_index{};
     std::uint32_t total_chunks{};
     std::uint64_t file_total_size{};
-    std::uint32_t raw_data_size{};   ///< payload bytes in this chunk
-    std::uint32_t chunk_capacity{};  ///< max payload bytes in any non-last chunk
+    std::uint32_t raw_data_size{};
+    std::uint32_t chunk_capacity{};
     std::string   orig_filename;
 };
 
@@ -35,7 +32,6 @@ struct ParsedMeta {
 
 namespace detail {
 
-/// Cross-platform large-file seek.
 inline void seek_file(std::FILE* f, std::uint64_t offset) {
 #if defined(_WIN32)
     if (_fseeki64(f, static_cast<std::int64_t>(offset), SEEK_SET) != 0)
@@ -88,50 +84,73 @@ using UniqueFile = std::unique_ptr<std::FILE, FileCloser>;
 
 /**
  * Parse "myfile_3of10.bmp" → base="myfile", idx=2 (0-based), total=10.
- * Returns false if the filename does not match the expected pattern.
+ * Hand-rolled parser using strtoul — avoids std::regex overhead entirely.
  */
 [[nodiscard]] static bool parse_chunk_filename(const fs::path& p,
                                                std::string&    base_out,
                                                std::uint32_t&  idx_out,
                                                std::uint32_t&  total_out)
 {
-    // Compiled once per process; pattern is immutable.
-    static const std::regex kPattern(R"(^(.+)_(\d+)of(\d+)$)");
-
-    std::smatch m;
     const std::string stem = p.stem().string();
-    if (!std::regex_match(stem, m, kPattern)) return false;
 
-    base_out  = m[1].str();
-    idx_out   = static_cast<std::uint32_t>(std::stoul(m[2].str())) - 1u; // → 0-based
-    total_out = static_cast<std::uint32_t>(std::stoul(m[3].str()));
+    // Pattern: <base>_<N>of<M>
+    const auto uscore = stem.rfind('_');
+    if (uscore == std::string::npos || uscore == 0 || uscore + 1 >= stem.size())
+        return false;
+
+    const char* suffix = stem.c_str() + uscore + 1;
+    char* end_n = nullptr;
+    const unsigned long n = std::strtoul(suffix, &end_n, 10);
+    if (end_n == suffix || n == 0) return false;
+
+    if (end_n[0] != 'o' || end_n[1] != 'f') return false;
+
+    const char* m_start = end_n + 2;
+    char* end_m = nullptr;
+    const unsigned long m = std::strtoul(m_start, &end_m, 10);
+    if (end_m == m_start || m == 0) return false;
+
+    if (*end_m != '\0') return false;
+
+    base_out  = stem.substr(0, uscore);
+    idx_out   = static_cast<std::uint32_t>(n) - 1u;   // → 0-based
+    total_out = static_cast<std::uint32_t>(m);
     return true;
 }
 
 /**
  * Build the ordered list of all chunk paths on disk.
- * Throws if any expected chunk file is absent.
+ * Uses string concatenation instead of ostringstream.
  */
 [[nodiscard]] static std::vector<fs::path> discover_chunks(const fs::path& any_chunk,
                                                            std::uint32_t   total_chunks,
                                                            std::string_view base_name)
 {
     const fs::path dir = any_chunk.parent_path();
-    std::vector<fs::path> paths(total_chunks);
+    const std::string tc_str = std::to_string(total_chunks);
+
+    std::vector<fs::path> paths;
+    paths.reserve(total_chunks);
 
     for (std::uint32_t i = 0; i < total_chunks; ++i) {
-        std::ostringstream oss;
-        oss << base_name << '_' << (i + 1) << "of" << total_chunks << ".bmp";
-        paths[i] = dir / oss.str();
-        if (!fs::exists(paths[i]))
-            throw std::runtime_error("Missing chunk file: " + paths[i].string());
+        std::string name;
+        name.reserve(base_name.size() + tc_str.size() + 16);
+        name.append(base_name);
+        name += '_';
+        name += std::to_string(i + 1);
+        name += "of";
+        name += tc_str;
+        name += ".bmp";
+
+        paths.push_back(dir / name);
+        if (!fs::exists(paths.back()))
+            throw std::runtime_error("Missing chunk file: " + paths.back().string());
     }
     return paths;
 }
 
 // ── Pre-allocation ────────────────────────────────────────────────────────────
 
-/** Punch the output file to its final size so parallel writes land at valid offsets. */
 static void preallocate_output(const std::string& path, std::uint64_t size) {
     auto f = detail::open_file(path, "wb");
     if (size > 0) {
@@ -157,7 +176,6 @@ void Decoder::decode(const std::string& any_chunk_path,
 
     logger.logf("Detected base='", base_name, "', total chunks=", total_chunks);
 
-    // Read the provided chunk's metadata to learn the original filename / size.
     std::vector<std::uint8_t> probe_pixels;
     BmpReader::read(chunk_p.string(), probe_pixels);
 
@@ -171,7 +189,6 @@ void Decoder::decode(const std::string& any_chunk_path,
 
     const auto chunk_files = discover_chunks(chunk_p, total_chunks, base_name);
 
-    // Prepare output.
     const fs::path  out_dir(output_dir);
     fs::create_directories(out_dir);
     const std::string out_path = (out_dir / probe.orig_filename).string();
@@ -181,8 +198,8 @@ void Decoder::decode(const std::string& any_chunk_path,
 
     // --- Parallel decode -------------------------------------------------------
     // Each chunk writes to a non-overlapping byte range of the output file.
-    // We hold a single open FILE* and serialise seek+write under write_mutex —
-    // cheaper than opening and closing the file once per chunk.
+    // A single shared FILE* with a mutex is cheaper than per-chunk open/close
+    // on Windows, where fclose forces a FlushFileBuffers syscall.
 
     const unsigned int eff_threads = num_threads
         ? num_threads : std::thread::hardware_concurrency();
@@ -214,9 +231,6 @@ void Decoder::decode(const std::string& any_chunk_path,
                 if (std::fwrite(raw_ptr, 1, raw_size, out_file.get()) != raw_size)
                     throw std::runtime_error("Write failed for chunk " + std::to_string(ci));
             }
-
-            logger.logf("Decoded chunk ", cm.chunk_index + 1, '/', total_chunks,
-                        " (", raw_size, " bytes) @ offset ", write_offset);
         });
     }
 

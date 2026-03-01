@@ -5,13 +5,20 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ─── Options ──────────────────────────────────────────────────────────────────
-option(BUILD_CLI "Build the command-line executable" ON)
+option(BUILD_CLI           "Build the command-line executable"            ON)
+option(ENABLE_NATIVE_ARCH  "Enable native CPU SIMD (AVX2 / -march=native)" ON)
 
 # ─── Compiler Flags ───────────────────────────────────────────────────────────
 if(MSVC)
     add_compile_options(/W4 /O2 /MP)
+    if(ENABLE_NATIVE_ARCH)
+        add_compile_options(/arch:AVX2)
+    endif()
 else()
     add_compile_options(-Wall -Wextra -O3)
+    if(ENABLE_NATIVE_ARCH)
+        add_compile_options(-march=native)
+    endif()
 endif()
 
 # ─── Shared library: pictobyte ────────────────────────────────────────────────
