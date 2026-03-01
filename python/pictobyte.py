@@ -56,8 +56,11 @@ def _find_library() -> Path:
     search_dirs = [
         Path(__file__).parent,
         Path(__file__).parent.parent / "build" / "bin",
+        Path(__file__).parent.parent / "build",
         Path(__file__).parent.parent / "cmake-build-release" / "bin",
+        Path(__file__).parent.parent / "cmake-build-release",
         Path(__file__).parent.parent / "cmake-build-debug" / "bin",
+        Path(__file__).parent.parent / "cmake-build-debug",
     ]
 
     for d in search_dirs:
