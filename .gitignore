@@ -19,6 +19,11 @@
 !examples/
 !examples/**
 
+# Re-ignore generated Python app build output inside the allowed python/ tree
+python/bin/
+python/dist/
+python/build/
+
 # Exclude specific garbage/build artifacts EVEN within allowed directories
 **/__pycache__/
 **/*.pyc

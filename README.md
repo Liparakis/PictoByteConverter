@@ -39,9 +39,10 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 cmake --build . --config Release
 ```
 
-On Windows, the build produces:
-- `bin/libpictobyte.dll`: The shared library.
-- `bin/pictobyte_cli.exe`: Simple command-line frontend.
+The build produces:
+- Windows: `bin/pictobyte.dll` or `bin/libpictobyte.dll` plus `bin/pictobyte_cli.exe`
+- Linux: `bin/libpictobyte.so` plus `bin/pictobyte_cli`
+- macOS: `bin/libpictobyte.dylib` plus `bin/pictobyte_cli`
 
 ## Usage
 
@@ -78,6 +79,43 @@ pb.encode("source.iso", "encoded/segment", chunk_size_mb=10, num_threads=0)
 # Decode (input path can be any chunk in the sequence)
 pb.decode("encoded/segment_1of5.bmp", "output_dir/")
 ```
+
+### PySide6 Desktop GUI
+
+The repo now includes a desktop app built on top of the same
+Python wrapper and native library.
+
+#### Features
+- Encode and decode workflows in one window
+- Drag-and-drop file and folder fields
+- Live log output from the native library
+- Persistent last-used paths and settings
+- Optional explicit DLL override for packaged or custom builds
+
+#### Run from source
+1. Build the native library so `pictobyte.dll` exists in a build directory.
+2. Install the GUI dependencies:
+   ```bash
+   python -m pip install ./python[build]
+   ```
+3. Launch the desktop app:
+   ```bash
+   python python/pictobyte_gui.py
+   ```
+
+#### Package the GUI
+1. Build the native library first.
+2. Run the staging and packaging script:
+   ```bash
+   python python/build_gui.py
+   ```
+3. The packaged app will be emitted under `python/bin/`:
+   - Windows: `PictoByteStudio.exe`
+   - Linux: `PictoByteStudio`
+   - macOS: `PictoByteStudio.app`
+
+The build script performs an explicit shared-library staging step before packaging so the
+desktop app does not rely on implicit auto-discovery during bundling.
 
 ## Technical Implementation Details
 

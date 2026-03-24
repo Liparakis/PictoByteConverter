@@ -5,7 +5,9 @@ extern "C" {
 #endif
 
 #ifdef _WIN32
-  #ifdef PICTOBYTE_EXPORTS
+  #if defined(PICTOBYTE_STATIC)
+    #define PB_API
+  #elif defined(PICTOBYTE_EXPORTS)
     #define PB_API __declspec(dllexport)
   #else
     #define PB_API __declspec(dllimport)
