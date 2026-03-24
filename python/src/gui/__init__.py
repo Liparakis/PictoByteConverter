@@ -1,0 +1,1 @@
+"""PictoByte Studio GUI package."""
